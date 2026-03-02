@@ -2,7 +2,10 @@ const http = require('http')
 const path = require('path')
 const crypto = require('crypto')
 
-try { require('dotenv').config({ path: path.join(__dirname, '..', '.env') }) } catch {}
+try {
+  require('dotenv').config({ path: path.join(__dirname, '..', '.env') })
+  require('dotenv').config({ path: path.join(__dirname, '.env') })
+} catch {}
 
 const SG_URL = process.env.SLOTSGATEWAY_API_URL
 const SG_LOGIN = process.env.SLOTSGATEWAY_LOGIN
