@@ -1,0 +1,11 @@
+{
+  "name": "slotsavaslari-server",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node index.cjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1"
+  }
+}
