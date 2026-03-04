@@ -162,6 +162,18 @@ async function trackBattleSpin(playerId, gameId) {
         })
 
         console.log(`[Battle] BİTTİ │ Kazanan: ${winner.username} │ Havuz: $${totalPot}`)
+
+        // Chat kazanç duyurusu
+        if (totalPot >= 100) {
+          const chatRooms = await sbGet('chat_rooms', { slug: 'eq.genel', select: 'id' })
+          if (chatRooms?.[0]) {
+            sbInsert('chat_messages', {
+              room_id: chatRooms[0].id, user_id: '00000000-0000-0000-0000-000000000000', username: 'Sistem',
+              user_role: 'system', type: 'announcement',
+              content: `🏆 ${winner.username} savaşta ₺${totalPot} havuzu kazandı!`,
+            }).catch(() => {})
+          }
+        }
       }
     } catch (err) {
       console.error('[Battle AutoFinish Error]', err.message)
@@ -1016,6 +1028,64 @@ const server = http.createServer(async (req, res) => {
       }
 
       return json(res, { count: matched.length, users: matched.slice(0, 50) })
+    }
+
+    // ─── Chat Rain ────────────────────────────────────
+    if (url === '/api/chat/rain' && req.method === 'POST') {
+      const body = await parseBody(req)
+      const { roomId, totalAmount, adminId } = body
+      if (!roomId || !totalAmount) return json(res, { error: 'Eksik parametre' }, 400)
+
+      const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString()
+      const recentMsgs = await sbGet('chat_messages', { room_id: `eq.${roomId}`, select: 'user_id', order: 'created_at.desc', limit: 50 })
+      const activeUserIds = [...new Set((recentMsgs || []).filter(m => m.user_id !== adminId).map(m => m.user_id))].slice(0, 20)
+
+      if (activeUserIds.length === 0) return json(res, { error: 'Aktif kullanıcı yok' }, 400)
+
+      const perUser = parseFloat((totalAmount / activeUserIds.length).toFixed(2))
+
+      for (const uid of activeUserIds) {
+        const bal = await getBalance(uid)
+        await sbPatch('profiles', `id=eq.${uid}`, { balance: parseFloat((bal + perUser).toFixed(2)) })
+        await sbInsert('transactions', { user_id: uid, amount: perUser, type: 'deposit', description: `Chat rain: ₺${perUser}` })
+      }
+
+      await sbInsert('chat_rains', { room_id: roomId, created_by: adminId, total_amount: totalAmount, per_user_amount: perUser, recipient_count: activeUserIds.length, recipients: JSON.stringify(activeUserIds) })
+      await sbInsert('chat_messages', { room_id: roomId, user_id: adminId, username: 'Sistem', user_role: 'system', content: `🌧️ RAIN! ₺${totalAmount} toplam, ${activeUserIds.length} kişiye ₺${perUser} dağıtıldı!`, type: 'event' })
+
+      console.log(`[Rain] ₺${totalAmount} → ${activeUserIds.length} kişi (₺${perUser}/kişi)`)
+      return json(res, { success: true, recipients: activeUserIds.length, perUser })
+    }
+
+    // ─── Chat Trivia ────────────────────────────────
+    if (url === '/api/chat/trivia' && req.method === 'POST') {
+      const body = await parseBody(req)
+      const { roomId } = body
+      const questions = await sbGet('chat_trivia_questions', { select: '*', order: 'times_asked.asc', limit: 1 })
+      const q = questions?.[0]
+      if (!q) return json(res, { error: 'Soru bulunamadı' }, 404)
+
+      await sbPatch('chat_trivia_questions', `id=eq.${q.id}`, { times_asked: (q.times_asked || 0) + 1 })
+      await sbInsert('chat_messages', {
+        room_id: roomId, user_id: '00000000-0000-0000-0000-000000000000', username: 'Trivia Bot',
+        user_role: 'system', type: 'event',
+        content: `🧠 TRIVIA!\n\n${q.question}\n\nÖdül: ₺${q.prize_amount}\nCevabı chate yaz!`,
+        metadata: JSON.stringify({ trivia_id: q.id, answer: q.answer, prize: q.prize_amount }),
+      })
+
+      return json(res, { success: true, question: q.question })
+    }
+
+    // ─── Chat Kazanç Duyurusu ───────────────────────
+    if (url === '/api/chat/announce-win' && req.method === 'POST') {
+      const body = await parseBody(req)
+      const { roomId, username, gameName, amount } = body
+      await sbInsert('chat_messages', {
+        room_id: roomId, user_id: '00000000-0000-0000-0000-000000000000', username: 'Sistem',
+        user_role: 'system', type: 'announcement',
+        content: `🎉 ${username} "${gameName}" oyununda ₺${amount} kazandı!`,
+      })
+      return json(res, { success: true })
     }
 
     json(res, { error: 'not found' }, 404)
