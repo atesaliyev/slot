@@ -123,7 +123,7 @@ async function trackBattleSpin(playerId, gameId) {
 
       const nextTurn = room.current_turn + 1
       if (nextTurn <= room.max_players) {
-        await sbPatch('battle_rooms', `id=eq.${bp.room_id}`, { current_turn: nextTurn })
+        await sbPatch('battle_rooms', `id=eq.${bp.room_id}`, { current_turn: nextTurn, active_game_url: null })
         await sbPatch('battle_players', `room_id=eq.${bp.room_id}&turn_order=eq.${nextTurn}`, { status: 'playing' })
         console.log(`[Battle] Sıra geçti → turn ${nextTurn} │ net: $${netResult.toFixed(2)}`)
       } else {
@@ -158,12 +158,12 @@ async function trackBattleSpin(playerId, gameId) {
         })
 
         await sbPatch('battle_rooms', `id=eq.${bp.room_id}`, {
-          status: 'finished', finished_at: new Date().toISOString(),
+          status: 'finished', finished_at: new Date().toISOString(), active_game_url: null,
         })
 
         console.log(`[Battle] BİTTİ │ Kazanan: ${winner.username} │ Havuz: $${totalPot}`)
 
-        // Chat kazanç duyurusu
+        // Chat kazanç duyurusu + Big Win kaydı
         if (totalPot >= 100) {
           const chatRooms = await sbGet('chat_rooms', { slug: 'eq.genel', select: 'id' })
           if (chatRooms?.[0]) {
@@ -173,6 +173,10 @@ async function trackBattleSpin(playerId, gameId) {
               content: `🏆 ${winner.username} savaşta ₺${totalPot} havuzu kazandı!`,
             }).catch(() => {})
           }
+          sbInsert('big_wins', {
+            user_id: winner.user_id, username: winner.username, game_name: room.game_name,
+            game_image: room.game_image, amount: totalPot, type: 'battle',
+          }).catch(() => {})
         }
       }
     } catch (err) {
@@ -340,6 +344,15 @@ const server = http.createServer(async (req, res) => {
         cashierurl: 'https://slotsavaslari.com',
       })
       console.log(`[Game] ${body.gameIdHash}`, data.error === 0 ? 'OK' : JSON.stringify(data))
+
+      if (data.error === 0 && data.response) {
+        const bp = await sbGet('battle_players', { user_id: `eq.${body.userId}`, status: 'eq.playing', select: 'room_id' })
+        if (bp?.[0]?.room_id) {
+          await sbPatch('battle_rooms', `id=eq.${bp[0].room_id}`, { active_game_url: data.response })
+          console.log(`[Spectator] Game URL saved for room ${bp[0].room_id.slice(0,8)}..`)
+        }
+      }
+
       return json(res, data)
     }
 
@@ -556,7 +569,7 @@ const server = http.createServer(async (req, res) => {
       // Sıradaki oyuncuya geç
       const nextTurn = room.current_turn + 1
       if (nextTurn <= room.max_players) {
-        await sbPatch('battle_rooms', `id=eq.${roomId}`, { current_turn: nextTurn })
+        await sbPatch('battle_rooms', `id=eq.${roomId}`, { current_turn: nextTurn, active_game_url: null })
         await sbPatch('battle_players', `room_id=eq.${roomId}&turn_order=eq.${nextTurn}`, { status: 'playing' })
         console.log(`[Battle] Sıra geçti: ${roomId.slice(0,8)}.. │ turn ${nextTurn} │ ${userId.slice(0,8)}.. bitti (net: ₺${netResult.toFixed(2)})`)
       } else {
@@ -606,6 +619,7 @@ const server = http.createServer(async (req, res) => {
         await sbPatch('battle_rooms', `id=eq.${roomId}`, {
           status: 'finished',
           finished_at: new Date().toISOString(),
+          active_game_url: null,
         })
 
         console.log(`[Battle] BİTTİ: ${roomId.slice(0,8)}.. │ Kazanan: ${winner.username} │ Havuz: ₺${totalPot}`)
