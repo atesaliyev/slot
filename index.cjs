@@ -61,6 +61,35 @@ async function getBalance(playerId) {
 function toCents(v) { return Math.round(v * 100) }
 function fromCents(v) { return parseInt(v) / 100 }
 
+async function processJackpot(totalPot, winnerId, winnerUsername, gameName) {
+  try {
+    const settings = await sbGet('jackpot_settings', { select: '*', limit: 1 })
+    const jp = settings?.[0]
+    if (!jp) return { cut: 0, winnerPot: totalPot }
+
+    const cut = parseFloat((totalPot * jp.cut_percentage / 100).toFixed(2))
+    const winnerPot = parseFloat((totalPot - cut).toFixed(2))
+    const newPool = parseFloat((parseFloat(jp.current_pool) + cut).toFixed(2))
+
+    await sbPatch('jackpot_settings', `id=eq.${jp.id}`, { current_pool: newPool, updated_at: new Date().toISOString() })
+    console.log(`[Jackpot] +₺${cut} → Havuz: ₺${newPool}`)
+
+    if (newPool >= parseFloat(jp.min_trigger_amount) && Math.random() * 100 < parseFloat(jp.trigger_chance)) {
+      const winnerBal = await getBalance(winnerId)
+      await sbPatch('profiles', `id=eq.${winnerId}`, { balance: parseFloat((winnerBal + newPool).toFixed(2)) })
+      await sbInsert('transactions', { user_id: winnerId, amount: newPool, type: 'game_win', description: `Jackpot kazancı!` })
+      await sbInsert('jackpot_history', { winner_id: winnerId, username: winnerUsername, amount: newPool, triggered_by: gameName })
+      await sbPatch('jackpot_settings', `id=eq.${jp.id}`, { current_pool: 0, last_winner_id: winnerId, last_won_at: new Date().toISOString() })
+      console.log(`[Jackpot] KAZANILDI! ${winnerUsername} → ₺${newPool}`)
+    }
+
+    return { cut, winnerPot }
+  } catch (err) {
+    console.log(`[Jackpot] Error: ${err.message}`)
+    return { cut: 0, winnerPot: totalPot }
+  }
+}
+
 async function sgApi(body) {
   const res = await fetch(SG_URL, {
     method: 'POST',
@@ -142,13 +171,15 @@ async function trackBattleSpin(playerId, gameId) {
           total_win: p.total_win, rank: i + 1,
         }))
 
+        const { winnerPot } = await processJackpot(totalPot, winner.user_id, winner.username, room.game_name)
+
         const winnerBal = await getBalance(winner.user_id)
         await sbPatch('profiles', `id=eq.${winner.user_id}`, {
-          balance: parseFloat((winnerBal + totalPot).toFixed(2)),
+          balance: parseFloat((winnerBal + winnerPot).toFixed(2)),
         })
 
         await sbInsert('transactions', {
-          user_id: winner.user_id, amount: totalPot, type: 'game_win',
+          user_id: winner.user_id, amount: winnerPot, type: 'game_win',
           description: `Savaş kazancı: ${room.game_name}`,
         })
 
@@ -343,7 +374,14 @@ const server = http.createServer(async (req, res) => {
         homeurl: 'https://slotsavaslari.com',
         cashierurl: 'https://slotsavaslari.com',
       })
-      console.log(`[Game] ${body.gameIdHash}`, data.error === 0 ? 'OK' : JSON.stringify(data))
+
+      if (data.error === 0 && data.response && body.buyFeature) {
+        const sep = data.response.includes('?') ? '&' : '?'
+        data.response = `${data.response}${sep}buyFeature=1&buy_feature=true&bonus_buy=1`
+        console.log(`[Game] ${body.gameIdHash} (BONUS BUY)`, 'OK')
+      } else {
+        console.log(`[Game] ${body.gameIdHash}`, data.error === 0 ? 'OK' : JSON.stringify(data))
+      }
 
       if (data.error === 0 && data.response) {
         const bp = await sbGet('battle_players', { user_id: `eq.${body.userId}`, status: 'eq.playing', select: 'room_id' })
@@ -591,21 +629,21 @@ const server = http.createServer(async (req, res) => {
           rank: i + 1,
         }))
 
-        // Kazanana ödeme
+        const { winnerPot } = await processJackpot(totalPot, winner.user_id, winner.username, room.game_name)
+
         const winnerBal = await getBalance(winner.user_id)
         await sbPatch('profiles', `id=eq.${winner.user_id}`, {
-          balance: parseFloat((winnerBal + totalPot).toFixed(2)),
+          balance: parseFloat((winnerBal + winnerPot).toFixed(2)),
           total_wins: (await sbGet('profiles', { id: `eq.${winner.user_id}`, select: 'total_wins' }))?.[0]?.total_wins + 1 || 1,
         })
 
-        // Herkesin total_games artır
         for (const p of allPlayers) {
           const prof = (await sbGet('profiles', { id: `eq.${p.user_id}`, select: 'total_games' }))?.[0]
           if (prof) await sbPatch('profiles', `id=eq.${p.user_id}`, { total_games: (prof.total_games || 0) + 1 })
         }
 
         await sbInsert('transactions', {
-          user_id: winner.user_id, amount: totalPot, type: 'game_win',
+          user_id: winner.user_id, amount: winnerPot, type: 'game_win',
           description: `Savaş kazancı: ${room.game_name}`,
         })
 
@@ -1100,6 +1138,95 @@ const server = http.createServer(async (req, res) => {
         content: `🎉 ${username} "${gameName}" oyununda ₺${amount} kazandı!`,
       })
       return json(res, { success: true })
+    }
+
+    // ─── JACKPOT: Ayarları Getir ────────────────────────
+    if (url === '/api/jackpot') {
+      const data = await sbGet('jackpot_settings', { select: '*', limit: 1 })
+      return json(res, data?.[0] || {})
+    }
+
+    // ─── JACKPOT: Geçmişi Getir ──────────────────────
+    if (url === '/api/jackpot/history') {
+      const data = await sbGet('jackpot_history', { select: '*', order: 'created_at.desc', limit: 20 })
+      return json(res, data || [])
+    }
+
+    // ─── JACKPOT: Ayarları Güncelle (admin) ──────────
+    if (url === '/api/jackpot/settings' && req.method === 'POST') {
+      const body = await parseBody(req)
+      const settings = await sbGet('jackpot_settings', { select: 'id', limit: 1 })
+      if (settings?.[0]) {
+        await sbPatch('jackpot_settings', `id=eq.${settings[0].id}`, {
+          cut_percentage: body.cut_percentage, min_trigger_amount: body.min_trigger_amount,
+          trigger_chance: body.trigger_chance, updated_at: new Date().toISOString(),
+        })
+      }
+      return json(res, { success: true })
+    }
+
+    // ─── TURNUVA: Bitir + Ödül Dağıt ─────────────────
+    if (url === '/api/tournaments/finish' && req.method === 'POST') {
+      const body = await parseBody(req)
+      const { tournamentId } = body
+
+      const tours = await sbGet('tournaments', { id: `eq.${tournamentId}`, select: '*' })
+      const tour = tours?.[0]
+      if (!tour) return json(res, { error: 'Turnuva bulunamadı' }, 404)
+
+      const participants = await sbGet('tournament_participants', { tournament_id: `eq.${tournamentId}`, select: '*', order: 'score.desc' })
+      if (!participants?.length) return json(res, { error: 'Katılımcı yok' }, 400)
+
+      const dist = tour.prize_distribution || [{ place: 1, pct: 50 }, { place: 2, pct: 30 }, { place: 3, pct: 20 }]
+      const prizePool = parseFloat(tour.prize_pool) || 0
+
+      for (const d of dist) {
+        const p = participants[d.place - 1]
+        if (!p) continue
+        const prize = parseFloat((prizePool * d.pct / 100).toFixed(2))
+        if (prize <= 0) continue
+
+        const bal = await getBalance(p.user_id)
+        await sbPatch('profiles', `id=eq.${p.user_id}`, { balance: parseFloat((bal + prize).toFixed(2)) })
+        await sbInsert('transactions', { user_id: p.user_id, amount: prize, type: 'game_win', description: `Turnuva ödülü: ${tour.name} (#${d.place})` })
+        await sbPatch('tournament_participants', `id=eq.${p.id}`, { rank: d.place, prize })
+        console.log(`[Tournament] Ödül: ${p.username} → ₺${prize} (#${d.place})`)
+      }
+
+      await sbPatch('tournaments', `id=eq.${tournamentId}`, { status: 'finished', end_time: new Date().toISOString() })
+      return json(res, { success: true, winners: dist.length })
+    }
+
+    // ─── TURNUVA: Eleme Sonraki Tur ──────────────────
+    if (url === '/api/tournaments/next-round' && req.method === 'POST') {
+      const body = await parseBody(req)
+      const { tournamentId } = body
+
+      const participants = await sbGet('tournament_participants', {
+        tournament_id: `eq.${tournamentId}`, eliminated_at: 'is.null', select: '*', order: 'score.desc',
+      })
+
+      if (participants.length < 2) return json(res, { error: 'Yeterli oyuncu yok' }, 400)
+
+      const rounds = await sbGet('tournament_rounds', { tournament_id: `eq.${tournamentId}`, select: '*', order: 'round_number.desc', limit: 1 })
+      const nextRoundNum = (rounds?.[0]?.round_number || 0) + 1
+
+      const matches = []
+      for (let i = 0; i < participants.length - 1; i += 2) {
+        matches.push({ player1: { id: participants[i].user_id, username: participants[i].username }, player2: { id: participants[i + 1].user_id, username: participants[i + 1].username }, winner: null })
+      }
+      if (participants.length % 2 === 1) {
+        const bye = participants[participants.length - 1]
+        matches.push({ player1: { id: bye.user_id, username: bye.username }, player2: null, winner: bye.user_id })
+      }
+
+      await sbInsert('tournament_rounds', { tournament_id: tournamentId, round_number: nextRoundNum, status: 'active', matches: JSON.stringify(matches) })
+      for (const p of participants) {
+        await sbPatch('tournament_participants', `id=eq.${p.id}`, { current_round: nextRoundNum })
+      }
+
+      console.log(`[Tournament] Tur ${nextRoundNum}: ${matches.length} eşleşme`)
+      return json(res, { round: nextRoundNum, matches })
     }
 
     json(res, { error: 'not found' }, 404)
